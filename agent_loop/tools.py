@@ -1,9 +1,7 @@
 """The tools the model can choose between, and the dispatch that runs them.
 
-A tool never raises at the loop's boundary. Anything that goes wrong - an unknown
-tool, input the tool cannot use, an expression that refuses to evaluate - comes
-back as a `ToolResult` marked as an error, so the model can read what went wrong
-and respond to it rather than the run ending.
+A tool never raises at the loop's boundary: anything that goes wrong comes back as a
+`ToolResult` marked as an error, so the model can read what happened and respond.
 """
 
 from __future__ import annotations
@@ -17,103 +15,68 @@ from typing import Any, Callable
 CALCULATOR = "calculator"
 WEB_SEARCH = "web_search"
 
+MAX_RESULT_BITS = 4096
+"""Roughly 1,200 decimal digits - far beyond any arithmetic this tool exists to do."""
+
 
 @dataclass(frozen=True)
 class ToolResult:
-    """What a tool hands back to the loop."""
-
     content: str
     is_error: bool = False
 
 
-# --- calculator ------------------------------------------------------------------------------
-#
-# The expression is parsed into a syntax tree and walked, rather than evaluated. Only numbers,
-# the arithmetic operators and the grouping the parser already resolved are permitted; a name,
-# an attribute, a subscript or a call has no branch here and is refused before anything runs.
+# The expression is parsed into a syntax tree and walked, never evaluated. Only numbers, the
+# arithmetic operators and the grouping the parser already resolved have a branch here; a
+# name, attribute, subscript or call is refused before anything runs.
 
-_BINARY_OPERATORS: dict[type[ast.operator], Callable[[Any, Any], Any]] = {
-    ast.Add: operator.add,
-    ast.Sub: operator.sub,
-    ast.Mult: operator.mul,
-    ast.Div: operator.truediv,
-    ast.FloorDiv: operator.floordiv,
-    ast.Mod: operator.mod,
-    ast.Pow: operator.pow,
+_BINARY = {
+    ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
+    ast.Div: operator.truediv, ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod, ast.Pow: operator.pow,
 }
-
-_UNARY_OPERATORS: dict[type[ast.unaryop], Callable[[Any], Any]] = {
-    ast.UAdd: operator.pos,
-    ast.USub: operator.neg,
-}
-
-
-MAX_RESULT_BITS = 4096
-"""Roughly 1,200 decimal digits - far beyond any arithmetic this tool exists to do."""
+_UNARY = {ast.UAdd: operator.pos, ast.USub: operator.neg}
 
 
 class _Refused(Exception):
     """The expression contains something the calculator will not evaluate."""
 
 
-def _refuse_unbounded_power(base: int | float, exponent: int | float) -> None:
-    """Refuse a power whose result would be enormous - predicted, never attempted.
+def _refuse_unbounded_power(base: Any, exponent: Any) -> None:
+    """`2 ** 999999999` is arithmetic with a finite value; it simply never returns.
 
-    `2 ** 999999999` is arithmetic, reaches nothing, and has a finite value; it simply
-    never returns. The size is predicted from the base's bit length so that nesting is
-    bounded too - each level is checked against the value the level below produced.
-    Floats are left alone: they overflow to infinity, which the caller already refuses.
+    The result's size is predicted from the base's bit length, so nesting is bounded too -
+    each level is checked against the value the level below produced. Floats are left to
+    the finite check in `calculator`, which already catches their overflow.
     """
     if not (isinstance(base, int) and isinstance(exponent, int)):
         return
     if exponent < 0 or base in (0, 1, -1):
         return
     if base.bit_length() * exponent > MAX_RESULT_BITS:
-        raise _Refused(
-            f"a result of about {base.bit_length() * exponent} bits is too large to compute"
-        )
+        raise _Refused(f"a result of about {base.bit_length() * exponent} bits is too large")
 
 
 def _evaluate(node: ast.AST) -> int | float:
     if isinstance(node, ast.Constant):
-        # bool is a subclass of int; True + 1 is not arithmetic anyone asked for.
         if isinstance(node.value, bool) or not isinstance(node.value, (int, float)):
             raise _Refused(f"{type(node.value).__name__} is not a number")
         return node.value
-
-    if isinstance(node, ast.BinOp):
-        apply = _BINARY_OPERATORS.get(type(node.op))
-        if apply is None:
-            raise _Refused(f"{type(node.op).__name__} is not an arithmetic operator")
+    if isinstance(node, ast.BinOp) and type(node.op) in _BINARY:
         left, right = _evaluate(node.left), _evaluate(node.right)
         if isinstance(node.op, ast.Pow):
             _refuse_unbounded_power(left, right)
-        return apply(left, right)
-
-    if isinstance(node, ast.UnaryOp):
-        apply_unary = _UNARY_OPERATORS.get(type(node.op))
-        if apply_unary is None:
-            raise _Refused(f"{type(node.op).__name__} is not an arithmetic operator")
-        return apply_unary(_evaluate(node.operand))
-
+        return _BINARY[type(node.op)](left, right)
+    if isinstance(node, ast.UnaryOp) and type(node.op) in _UNARY:
+        return _UNARY[type(node.op)](_evaluate(node.operand))
     raise _Refused(f"{type(node).__name__} is not arithmetic")
-
-
-def _format(value: int | float) -> str:
-    if isinstance(value, float) and value.is_integer():
-        return str(int(value))
-    return str(value)
 
 
 def calculator(expression: str) -> ToolResult:
     """Evaluate an arithmetic expression, refusing anything that is not arithmetic."""
     try:
-        tree = ast.parse(expression, mode="eval")
+        value = _evaluate(ast.parse(expression, mode="eval").body)
     except SyntaxError as exc:
         return ToolResult(f"error: {expression!r} is not a valid expression ({exc.msg})", True)
-
-    try:
-        value = _evaluate(tree.body)
     except _Refused as exc:
         return ToolResult(f"error: refused to evaluate {expression!r} - {exc}", True)
     except ZeroDivisionError:
@@ -121,46 +84,33 @@ def calculator(expression: str) -> ToolResult:
     except (OverflowError, ValueError) as exc:
         return ToolResult(f"error: {expression!r} has no value ({exc})", True)
     except TypeError:
-        # A complex intermediate - from a negative base to a fractional power - reaching an
-        # operator that has no complex form, such as `(-8) ** 0.5 // 2`. The guard below
-        # inspects the final value, which this never reaches.
+        # A complex intermediate (negative base, fractional power) reaching `//` or `%`.
         return ToolResult(f"error: {expression!r} has no real value", True)
 
-    # A negative base raised to a fractional power gives a complex number, which is a
-    # value but not one this tool answers with - and complex skips the finite check below.
+    # A negative base to a fractional power gives a complex number, which skips the finite check.
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return ToolResult(f"error: {expression!r} has no real value", True)
-
     if isinstance(value, float) and not math.isfinite(value):
         return ToolResult(f"error: {expression!r} has no finite value", True)
+    if isinstance(value, float) and value.is_integer():
+        return ToolResult(str(int(value)))
+    return ToolResult(str(value))
 
-    return ToolResult(_format(value))
 
-
-# --- web search ------------------------------------------------------------------------------
-#
-# Stub results. Nothing here reaches the network: the point of this tool is to give the model a
-# value it was not told, so a task can require a lookup before a calculation.
-
-_STUB_RESULTS: dict[str, str] = {
+_STUB_RESULTS = {
     "tokyo": "Tokyo metropolitan population: 14180000 (stub result)",
-    "london": "Greater London population: 8866000 (stub result)",
-    "paris": "Paris city population: 2103000 (stub result)",
     "france": "France population: 68400000 (stub result)",
-    "japan": "Japan population: 123300000 (stub result)",
+    "london": "Greater London population: 8866000 (stub result)",
 }
 
 
 def web_search(query: str) -> ToolResult:
-    """Return a stub search result for a query, without touching the network."""
-    lowered = query.lower()
+    """Return a stub result for a query. Nothing here reaches the network."""
     for term, result in _STUB_RESULTS.items():
-        if term in lowered:
+        if term in query.lower():
             return ToolResult(result)
     return ToolResult(f"No stub result is held for {query!r} (stub result)")
 
-
-# --- declarations and dispatch ---------------------------------------------------------------
 
 TOOLS: list[dict[str, Any]] = [
     {
@@ -172,9 +122,7 @@ TOOLS: list[dict[str, Any]] = [
         ),
         "input_schema": {
             "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "What to search for."},
-            },
+            "properties": {"query": {"type": "string", "description": "What to search for."}},
             "required": ["query"],
         },
     },
@@ -187,17 +135,14 @@ TOOLS: list[dict[str, Any]] = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "expression": {
-                    "type": "string",
-                    "description": "An arithmetic expression, for example '14180000 / 1000'.",
-                },
+                "expression": {"type": "string", "description": "For example '14180000 / 1000'."}
             },
             "required": ["expression"],
         },
     },
 ]
 
-# Each entry is the tool's function and the name of the single input it reads.
+# Each tool's function, and the name of the single input it reads.
 _HANDLERS: dict[str, tuple[Callable[[str], ToolResult], str]] = {
     CALCULATOR: (calculator, "expression"),
     WEB_SEARCH: (web_search, "query"),
@@ -205,24 +150,14 @@ _HANDLERS: dict[str, tuple[Callable[[str], ToolResult], str]] = {
 
 
 def dispatch(name: str, tool_input: Any) -> ToolResult:
-    """Run the named tool against the input the model supplied.
-
-    Returns an error result rather than raising, whatever the model asked for.
-    """
-    handler = _HANDLERS.get(name)
-    if handler is None:
-        known = ", ".join(sorted(_HANDLERS))
-        return ToolResult(f"error: there is no tool named {name!r} (available: {known})", True)
-
-    run, field = handler
-    if not isinstance(tool_input, dict):
-        return ToolResult(f"error: {name} needs an object of arguments, not {tool_input!r}", True)
-
-    value = tool_input.get(field)
+    """Run the named tool on the model's input, returning an error result rather than raising."""
+    if name not in _HANDLERS:
+        return ToolResult(f"error: there is no tool named {name!r}", True)
+    run, field = _HANDLERS[name]
+    value = tool_input.get(field) if isinstance(tool_input, dict) else None
     if not isinstance(value, str) or not value.strip():
         return ToolResult(f"error: {name} needs a non-empty {field!r} string", True)
-
     try:
         return run(value)
     except Exception as exc:  # a tool must never end the run by raising
-        return ToolResult(f"error: {name} failed on {value!r} ({type(exc).__name__}: {exc})", True)
+        return ToolResult(f"error: {name} failed ({type(exc).__name__}: {exc})", True)
