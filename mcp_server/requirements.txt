@@ -1,0 +1,11 @@
+# The MCP server is a separate process from the Django project in sdd_django_demo/. It talks to
+# that project's API over HTTP and imports no part of it, so it keeps its own pinned
+# requirements and its own environment - installing one has never to install the other.
+#
+# fastmcp: the MCP server framework, including the Google authentication provider used to
+# identify the calling person.
+# requests: the HTTP client used to call the API.
+# pytest: the test runner, matching the version the Django project pins.
+fastmcp==4.0.3
+pytest==9.1.1
+requests==2.34.2

@@ -10,6 +10,10 @@ db.sqlite3
 .pytest_cache/
 .private/
 
+# Local Google signin configuration (see sdd_django_demo/sdd_django_demo/settings.py).
+# Holds client ids, never a secret, but it is per-machine and never belongs in the repo.
+.env
+
 # sdd_django_demo build workspace (distilled into reference/signup-worked-example/)
 sdd_django_demo/.venv/
 sdd_django_demo/db.sqlite3

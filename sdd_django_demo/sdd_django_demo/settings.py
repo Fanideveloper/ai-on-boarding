@@ -14,8 +14,15 @@ import os
 from pathlib import Path
 from urllib.parse import urlparse
 
+from dotenv import load_dotenv
+
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+# Read BASE_DIR/.env into the environment, if it exists. Every setting below still has a
+# working default, so the file is a convenience for anyone configuring Google signin - not
+# something the project needs in order to run or to be tested.
+load_dotenv(BASE_DIR / '.env')
 
 
 # Quick-start development settings - unsuitable for production
@@ -68,11 +75,28 @@ INSTALLED_APPS = [
 
 REST_FRAMEWORK = {
     'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
+    # How many reverse proxies sit in front of this application. It decides which address a
+    # per-caller throttle keys on, so it is a security setting, not a deployment detail.
+    #
+    # DRF's default is None, which means "trust X-Forwarded-For entirely" - and that header is
+    # written by whoever is calling. A caller who varies it walks straight through any
+    # per-caller limit. 0 means ignore the header and use the peer address, which is correct
+    # for local dev, the test suite, and any deployment reached directly.
+    #
+    # Behind nginx or a load balancer, set DJANGO_NUM_PROXIES to the number of proxies that
+    # append to the header (usually 1), so the caller's real address is taken from the right
+    # position rather than from whatever they claimed.
+    'NUM_PROXIES': int((os.environ.get('DJANGO_NUM_PROXIES') or '').strip() or 0),
     # Keyed on the submitted email address, not the caller: the harm this caps is
     # done to an account, and every request supersedes that account's previous
     # code. See the change's design.md.
     'DEFAULT_THROTTLE_RATES': {
         'password-reset': '5/hour',
+        # Google signin is unauthenticated and each attempt costs an outbound request to
+        # Google, so an uncapped endpoint lets any caller generate unbounded outbound traffic
+        # from this server. Keyed on the caller, because the address a token belongs to is not
+        # known until Google has already been asked.
+        'google-signin': '20/min',
     },
 }
 
@@ -261,3 +285,26 @@ DEFAULT_FROM_EMAIL = os.environ.get('RESET_SMTP_FROM', 'no-reply@example.com')
 # from before) when unset, so local dev and the test suite see no difference.
 
 RESET_LINK_BASE_URL = os.environ.get('RESET_LINK_BASE_URL', 'http://localhost:8000')
+
+
+# Google signin
+#
+# This project verifies a Google access token the caller already holds; it never redeems an
+# authorization code, so no client secret is needed here - only the client id(s) a token is
+# allowed to name as its audience.
+#
+# A list rather than a single value, comma-separated, e.g.
+# GOOGLE_OAUTH_CLIENT_IDS=abc.apps.googleusercontent.com,def.apps.googleusercontent.com - so a
+# second client can be registered later without changing how the audience check works. Empty by
+# default, which accepts nothing: Google signin is inert until a deployment configures it, and
+# no contributor needs anything set to run or test the rest of the project.
+GOOGLE_OAUTH_CLIENT_IDS = [
+    client_id.strip()
+    for client_id in os.environ.get('GOOGLE_OAUTH_CLIENT_IDS', '').split(',')
+    if client_id.strip()
+]
+
+# Optionally restrict Google signin to one Workspace domain, e.g. 'example.com'. Empty means no
+# restriction. Stripped for the same reason the SMTP host above is: a variable set to whitespace
+# is truthy, and would otherwise switch on a restriction that no account could ever satisfy.
+GOOGLE_ALLOWED_HD = os.environ.get('GOOGLE_ALLOWED_HD', '').strip()

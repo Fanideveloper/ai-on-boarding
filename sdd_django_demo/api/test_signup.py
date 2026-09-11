@@ -179,6 +179,25 @@ def test_signup_rejects_password_without_letter(client):
 
 
 @pytest.mark.django_db
+def test_signup_rejects_password_longer_than_maximum(client):
+    response = signup(client, password='a1' + 'x' * 127)
+
+    assert response.status_code == 400
+    assert 'password' in response.data
+    # The message has to name the bound: it is the one thing the person can act on without
+    # guessing, and it is what the assistant calling this API repeats back to them.
+    assert 'at most 128' in str(response.data['password'])
+
+
+@pytest.mark.django_db
+def test_signup_accepts_password_at_the_maximum_length(client):
+    response = signup(client, password='a1' + 'x' * 126)
+
+    assert response.status_code == 200
+    assert User.objects.filter(username='ada').exists()
+
+
+@pytest.mark.django_db
 def test_signup_creates_exactly_one_account(client):
     signup(client)
 
